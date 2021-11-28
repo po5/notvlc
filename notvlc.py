@@ -182,3 +182,195 @@ def shifteroo(clip, left=0, top=0):
     clip = clip.resize.Bicubic(src_left=left%og_w, src_top=top%og_h)
     clip = core.std.CropAbs(clip, og_w, og_h)
     return clip
+
+def gen_shifts(clip, n, shift, forward=True, backward=True):
+    """
+    Return shifts of n neighboring frames.
+    Meant for credit blending to reduce flicker.
+
+    :param clip:            Clip to shift
+    :param n:               How many neighboring frames to shift
+    :param shift:           Float of how many pixels the credits scroll each frame 
+    """
+    shifts = [clip]
+    for cur in range(1, n+1):
+        if forward:
+            shifts.append(clip[1*cur:].resize.Bicubic(src_top=-shift*cur)+clip[0]*cur)
+        if backward:
+            shifts.append(clip[0]*cur+clip.resize.Bicubic(src_top=shift*cur)[:-1*cur])
+    return shifts
+
+def shift_blend(clip, n, shift, forward=True, backward=True):
+    """
+    Simple function to test shift values
+    """
+    return core.average.Mean(gen_shifts(clip, n, shift, forward, backward))
+
+def shift_mask(mask, mask_height, shift, forward=True, backward=True, vertical=True):
+    """
+    Masks scrolling credits by referencing less busy areas of the frame.
+
+    :param mask:            Masked credits clip constrained to the 'stable' area
+    :param mask_height:     Height of the 'stable' area
+    :param shift:           Float of how many pixels the credits scroll each frame
+    """
+    import kagefunc as kgf
+
+    mask = mask.std.ShufflePlanes(planes=0, colorfamily=GRAY)
+    return_mask = mask
+    shifted = 0
+    while shifted < mask.height:
+        shifted += mask_height
+        if forward:
+            shift_frames = int(shifted/shift)
+            shifted_mask = mask[0]*shift_frames+mask.resize.Bicubic(src_top=shift_frames*shift)[:-1*shift_frames]
+            try:
+                original_area = kgf.squaremask(mask, width=mask.width, height=shifted, offset_x=0, offset_y=mask.height-shifted).std.Invert()
+            except:
+                return return_mask
+            shifted_mask = core.std.Expr([original_area, shifted_mask], "x y min")
+            return_mask = core.std.Expr([return_mask, shifted_mask], "x y max")
+    return return_mask
+
+def FalPosCrop(n, f, clip, clip2, planestatsmin):
+    if f.props.PlaneStatsMin > planestatsmin:
+        return clip
+    else:
+        return clip2
+
+def Stab3(clp, ts=7, dxmax=None, dymax=None, UVfix=False, FixFalPos=False, zoom=1, mirror=0, PAR=1.0, Prefilter=None, Luma_Exp=1, Fill3pBorders=True):
+    """
+    same as Stab2 but with some changes
+
+    clp: input clip
+    ts: frames to temporal average for better motion estimation (max. 7)
+    dxmax: maximum deviation in pixels
+    dymax: x, and y should be the same
+    UVfix: Fixes the bug of change of HUE in Depan, not need in depan 1.13.1 and up
+    FixFalPos: Fixes borders of 3 or more pixels wide. Use along crop(2,2,-2,-2)...
+    zoom: maximum zoom factor (1 disabled)
+    mirror: Edge filling. 0 off, 15 everything on
+    PAR: PAR of your source
+    Prefilter: prefilter
+    Luma_Exp: Luma Rebuild
+    Fill3pBorders: Fixes borders of 3 or less pixels wide.
+    """
+    from functools import partial
+    import math
+
+    dxmax = int(round(clp.width/180)) if dxmax is None else dxmax
+    dymax = dxmax if dymax is None else dymax
+
+    Pref = clp if Prefilter is None else Prefilter
+    temp = Pref.focus2.TemporalSoften2(ts, 255, 255, 25, 2) # SC thr to 25 otherwise pans will stutter
+    rep = temp.rgvs.Repair(Pref.focus2.TemporalSoften2(1, 255, 255, 25, 2), mode=2)
+    inter = core.std.Interleave([rep, Pref])
+
+    """
+    # temporal stable auto-contrast (better subpixel detection)
+    parta = AutoAdjust(inter, temporal_radius=10, auto_balance=False, auto_gain=True, use_interp=True, avg_safety=0.25, dark_limit=10, bright_limit=10, gamma_limit=1.0, dark_exclude=0.05, bright_exclude=0.05, chroma_process=0, scd_threshold=16, input_tv=False, output_tv=False, high_bitdepth=False, debug_view=False) # closed source?
+    partb = inter.resize.Bicubic(range_s="full", range_in_s="limited", dither_type="error_diffusion") if Luma_Exp==1 else inter
+    Luma_Expa = parta if Luma_Exp==2 else partb
+    """
+    Luma_Expa = inter.resize.Bicubic(range_s="full", range_in_s="limited", dither_type="error_diffusion") if Luma_Exp==1 else inter
+
+    mdata = core.mv.DepanEstimate(Luma_Expa, pixaspect=PAR, trust=0, dxmax=dxmax, dymax=dymax, zoommax=zoom)
+    stabclip = core.mv.DepanCompensate(inter if Prefilter is None else core.std.Interleave([rep, clp]), data=mdata, offset=-1, mirror=mirror, pixaspect=PAR, matchfields=False, subpixel=2)
+    stabclip = stabclip.std.SelectEvery(cycle=2, offsets=0)
+    stabcrop = stabclip
+
+    if FixFalPos:
+        thick = 3.0 if Fill3pBorders else 2.0  # removing >2px wide borders
+        cropx = dxmax*2
+        ratiox = math.ceil(99-thick/cropx*100)
+        
+        crop1 = stabcrop.fb.FillBorders(0,0,0,cropx).std.PlaneStats()
+        crop2 = stabcrop.fb.FillBorders(0,cropx,0,0).std.PlaneStats()
+        crop3 = stabcrop.fb.FillBorders(0,0,cropx,0).std.PlaneStats()
+        crop4 = stabcrop.fb.FillBorders(cropx,0,0,0).std.PlaneStats()
+        planestatsmin = clp.std.BlankClip().std.PlaneStats().get_frame(0).props.PlaneStatsMin
+        stabcrop = core.std.FrameEval(stabcrop, partial(FalPosCrop, clip=stabcrop, clip2=crop1, planestatsmin=planestatsmin), prop_src=crop1)
+        stabcrop = core.std.FrameEval(stabcrop, partial(FalPosCrop, clip=stabcrop, clip2=crop2, planestatsmin=planestatsmin), prop_src=crop2)
+        stabcrop = core.std.FrameEval(stabcrop, partial(FalPosCrop, clip=stabcrop, clip2=crop3, planestatsmin=planestatsmin), prop_src=crop3)
+        stabcrop = core.std.FrameEval(stabcrop, partial(FalPosCrop, clip=stabcrop, clip2=crop4, planestatsmin=planestatsmin), prop_src=crop4)
+
+    """
+    bpad = Fill3pBorders # pad if not even and subsampling requires it
+
+    stabclip.FillBorders(pad=0 if bpad is None else 1, FixFalPos=stabcrop if FixFalPos else None) if Fill3pBorders else stabcrop
+    """
+
+    """
+    if UVfix:
+        lumaf=stabcrop
+        
+
+        blue=round((AverageChromaU(clp) - AverageChromaU()) * 256.0)
+        red=round((AverageChromaV(clp) - AverageChromaV()) * 256.0)
+         
+        scr = Dither_convert_8_to_16(clp)
+        scr = clp.SmoothTweak16(saturation=1.0,hue1=min(384,blue),hue2=min(384,red),HQ=true)
+        scr = clp.DitherPost(stacked=true,prot=false,mode=6,y=1,slice=false)
+
+        stabcrop = Mergeluma(lumaf, scr)
+    """
+
+    return stabcrop
+
+# mostly pasted from lvsfunc.deinterlace.TIVTC_VFR
+def magicivtc(clip, tfm_in="tfm_in.txt", tdec_in="tdec_in.txt"):
+    import lvsfunc as lvf
+
+    tfm_in = Path(tfm_in).resolve()
+    tdec_in = Path(tdec_in).resolve()
+
+    # TIVTC can't write files into directories that don't exist
+    if not tfm_in.parent.exists():
+        tfm_in.parent.mkdir(parents=True)
+    if not tdec_in.parent.exists():
+        tdec_in.parent.mkdir(parents=True)
+
+    if not (tfm_in.exists() and tdec_in.exists()):
+        ivtc_clip = core.tivtc.TFM(clip, output=str(tfm_in)).tivtc.TDecimate(mode=1, hint=True, output=str(tdec_in))
+
+        with lvf.render.get_render_progress() as pr:
+            task = pr.add_task("Analyzing frames...", total=ivtc_clip.num_frames)
+
+            def _cb(n, total):
+                pr.update(task, advance=1)
+
+            with open(os.devnull, "wb") as dn:
+                ivtc_clip.output(dn, progress_update=_cb)
+
+        # Allow it to properly finish writing the logs
+        time.sleep(0.5)
+        del ivtc_clip # Releases the clip, and in turn the filter (prevents it from erroring out)
+
+    return clip.tivtc.TFM(input=str(tfm_in)).tivtc.TDecimate(mode=1, hint=True, input=str(tdec_in), tfmIn=str(tfm_in))
+
+def magicdecimate(fm, tdec_in="tdec_in.txt"):
+    import lvsfunc as lvf
+
+    tdec_in = Path(tdec_in).resolve()
+
+    # TIVTC can't write files into directories that don't exist
+    if not tdec_in.parent.exists():
+        tdec_in.parent.mkdir(parents=True)
+
+    if not tdec_in.exists():
+        ivtc_clip = fm.tivtc.TDecimate(mode=1, hint=True, output=str(tdec_in))
+
+        with lvf.render.get_render_progress() as pr:
+            task = pr.add_task("Analyzing frames...", total=ivtc_clip.num_frames)
+
+            def _cb(n, total):
+                pr.update(task, advance=1)
+
+            with open(os.devnull, "wb") as dn:
+                ivtc_clip.output(dn, progress_update=_cb)
+
+        # Allow it to properly finish writing the logs
+        time.sleep(0.5)
+        del ivtc_clip # Releases the clip, and in turn the filter (prevents it from erroring out)
+
+    return fm.tivtc.TDecimate(mode=1, hint=True, input=str(tdec_in))
